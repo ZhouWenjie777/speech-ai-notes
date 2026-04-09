@@ -1,0 +1,44 @@
+---
+data: 2025-12-19T16:32:00
+tags:
+---
+1. string 类常用构造与操作
+	- 头文件
+		- `#include <string>` 提供 `std::string`；属于 STL 容器，内部用动态数组管理字符，自动扩容
+	- 构造方式
+		- `string one("Lottery Winner!");`  
+		- `string two(20, '$');`                         // 20 个 '$'
+		- `string three(one);`                            // 拷贝构造
+		- `string four;`                                       // 默认空串
+		- `string five(alls, 20);`                      // 从 C 串前 20 字符
+		- `string six(alls+6, alls+10);`           // 迭代器区间`[begin, end)`
+		- `string seven(&five[6], &five[10]);` // 子串迭代器
+		- `string eight(four, 7, 16);`               // 子串构造：源串+起始位置+长度
+	- 基本运算符
+		- 赋值 `=`：自动释放旧空间并深拷贝
+		- 拼接 `+`：返回新串，原串不变；支持 `string + string, string + c-str, char + string`
+		- 比较 `== != < > <= >=`：按字典序逐个字符比较，时间复杂度 O(n)
+		- 下标 `[]`：返回 `char&`，可读写；越界行为未定义（不检查）
+		- 流式 IO `<< >>`：自动处理空格分隔；读取超长串内部会扩容
+	- 与 C 串互操作
+		- `c_str()` 得到 `const char*`；生命周期与 string 对象绑定，对象销毁后指针失效
+		- `data()` C++17 起与 `c_str()` 相同；之前可能尾部无`\0`
+		- 构造函数接受 `const char*` 时自动计算长度，含`\0`之前的所有字符
+	- 容量管理
+		- `size()` / `length()` 返回字符数（不含 `\0`）
+		- `capacity()` 返回当前分配总空间；当 `size() == capacity()` 且继续插入时，触发**重新分配 + 拷贝**（ amortized O(1) ）
+		- `reserve(n)` 手动预留容量，减少频繁扩容；`shrink_to_fit()` 请求归还多余空间（实现可忽略）
+	- 修改接口
+		- `append` `+=` `push_back`：尾部增字符/串
+		- `insert(pos, str)` `erase(pos, len)`：中间增删，会引起后续字符搬移
+		- `clear()` 清空内容，容量通常保留；`pop_back()` 删除末字符
+	- 查找与截取
+		- `find(sub, pos = 0)` 返回子串首次位置，找不到返回 `string::npos`
+		- `substr(pos, len)` 返回新子串；`len`缺省到结尾
+		- `compare` 提供三向比较结果（-1/0/1）
+	- 异常安全 
+		- 所有修改函数强异常安全：抛异常时原串保持不变；仅分配失败可能抛 `std::bad_alloc`
+	- 零拷贝优化（C++11 起）
+		- 支持移动语义与短字符串优化（`SSO`），小字符串（通常 ≤15 字节）直接存在对象内部，避免动态分配
+	- 建议
+		- 优先用`string`替代手动`char[]`/`new char[]`；需要与 C API 交互时用 `c_str()` 传参，用完即弃，不保存长期指针

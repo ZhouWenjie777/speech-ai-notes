@@ -1,0 +1,47 @@
+---
+data: 2026-02-09T16:46:00
+tags:
+---
+1. 解耦裁剪与动态采样策略优化（Decoupled Clip and Dynamic sAmpling Policy Optimization，DAPO）
+	- [（1）通俗讲解](https://www.zhihu.com/question/1893241692582285916/answer/1967273400784369077) 
+	- [（2）通俗讲解](https://baijiahao.baidu.com/s?id=1826915667004578367&wfr=spider&for=pc) 
+	- [（3）通俗讲解](https://zhuanlan.zhihu.com/p/1891116737048594100) 
+2. DAPO 算法流程（RL，解耦裁剪与动态采样策略优化）
+	- 输入：SFT 模型 $\pi_{ref}$（冻结），策略模型 $\pi_\theta$，问题-答案数据集 $\mathcal{D}$，KL 超参 $\beta$，组大小 $G$，低裁剪阈值 $\varepsilon_{low}$，高裁剪阈值 $\varepsilon_{high}$，最大长度 $L_{max}$，缓存长度 $L_{cache}$ 
+	- 输出：与人类偏好对齐的模型 $\pi_\theta$ 
+	- 算法步骤：
+		- 初始化：$\pi_\theta \leftarrow \pi_{ref}$（可复制参数或热启动）
+		- 循环直至收敛
+			- a. **动态采样过滤**（Dynamic Sampling）
+				- 从 $\mathcal{D}$ 采样问题 $q$ 和参考答案 $a$ 
+				- 用旧策略 $\pi_{\theta_{old}}$ 生成 $G$ 个响应 $\{o_1, o_2, ..., o_G\}$ 
+				- **过滤条件**：只保留准确率既不全为0也不全为1的样本（即 $0 < |\{o_i \mid \text{is\_equivalent}(a, o_i)\}| < G$）
+				- 若 batch 未满，持续采样直到达到 batch
+			-  b. **Token级奖励计算**（Token-Level Reward）
+				- 对每个 token 位置 $t$ 计算奖励 $R_i$（包含规则正确性奖励 + 长度惩罚）
+				- **长度惩罚**（Soft Overlong Punishment）：$$R_{length}(y) = \begin{cases} 0, & |y| \leq L_{max} - L_{cache} \\ \frac{(L_{max}-L_{cache})-|y|}{L_{cache}}, & L_{max}-L_{cache} < |y| \leq L_{max} \\ -1, & L_{max} < |y| \end{cases}$$
+				- 总奖励：$R_i = R_{rule} + R_{length}$ 
+			- c. **组内优势估计**（Group Relative Advantage）
+				- 计算组内奖励均值：$\bar{R} = \frac{1}{G}\sum_{i=1}^{G} R_i$ 
+				- 计算组内奖励标准差：$\sigma = \sqrt{\frac{1}{G}\sum_{i=1}^{G}(R_i - \bar{R})^2}$
+				- 计算相对优势（扩展到 token 级）：$\hat{A}_{i,t} = \frac{R_i - \bar{R}}{\sigma}$（同一响应内所有 token 共享相同优势）
+			- d. **解耦裁剪策略优化**（Decouple Clip）
+				- 计算 token 级重要性采样比率：$r_{i,t}(\theta) = \frac{\pi_\theta(o_{i,t} \mid q, o_{i,<t})}{\pi_{\theta_{old}}(o_{i,t} \mid q, o_{i,<t})}$ 
+				- **解耦裁剪**：
+					- 低裁剪：$\varepsilon_{low}$ 小，防止低概率 token 被过度打压至 0（保护多样性）
+					- 高裁剪：$\varepsilon_{high}$ 大，允许低概率 token 概率大幅上升（鼓励探索）
+				- 裁剪目标：$r_{i,t}^{clip}(\theta) = \text{clip}(r_{i,t}(\theta), 1-\varepsilon_{low}, 1+\varepsilon_{high})$ 
+			- e. **Token级策略优化**（Token-Level Policy Gradient Loss）
+				- **目标函数（最大化）**：$$\mathcal{J}_{DAPO}(\theta) = \mathbb{E}_{(q,a)\sim\mathcal{D},\{o_i\}_{i=1}^G\sim\pi_{\theta_{old}}(\cdot|q)} \left[ \frac{1}{\sum_{i=1}^{G}|o_i|} \sum_{i=1}^{G}\sum_{t=1}^{|o_i|} \min\left( r_{i,t}(\theta)\hat{A}_{i,t}, r_{i,t}^{clip}(\theta)\hat{A}_{i,t} \right) \right]$$
+				- 约束条件：$0 < |\{o_i \mid \text{is\_equivalent}(a, o_i)\}| < G$
+				- **或损失函数（最小化）**：$\mathcal{L}_{DAPO}(\theta) = -\mathcal{J}_{DAPO}(\theta)$ 
+			- f. 反向传播更新 $\pi_\theta$
+			- g. 定期更新 $\pi_{\theta_{old}} \leftarrow \pi_\theta$ 
+		- 返回 $\pi_\theta$ 
+	- 关键细节
+		- **Overlong Filtering**：硬性截断，训练前过滤超长样本
+		- **Clip-Higher**：解耦 $\varepsilon_{low}$ 和 $\varepsilon_{high}$，低概率 token 获得更大更新空间，缓解 GRPO 探索不足问题
+		- **Dynamic Sampling**：过滤全对/全错样本，确保 batch 内梯度有效，提升训练效率
+		- **Token-Level Loss**：按 token 数平均而非样本平均，长序列贡献更合理，避免短序列主导梯度
+		- **Soft Overlong Punishment**：软性长度惩罚，超过 $L_{max}-L_{cache}$ 开始线性惩罚，超过 $L_{max}$ 惩罚为-1，抑制冗长生成
+		- 四项改进（Clip-Higher + Dynamic Sampling + Token-Level Loss + Overlong Reward Shaping）相互独立，均可单独生效

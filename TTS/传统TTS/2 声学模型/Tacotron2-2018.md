@@ -1,0 +1,84 @@
+---
+data: 2026-01-09T16:47:00
+tags:
+---
+1. 摘要核心
+	- 系统组成
+		- 阶段 1:  seq2seq 网络将**字符嵌入** → **mel-spectrogram**
+		- 阶段 2：改进版 **WaveNet** 以 mel 为条件，并行生成 24 kHz 波形
+	- 性能
+		- 5 分制 MOS 4.53，与专业录音 4.58 无显著差异，首次在“自然度”上逼近真人
+	- 关键验证
+		- 消融实验确认：用**紧凑 mel** 替代传统 linguistic + duration + F0 条件，WaveNet 参数量↓，音质不降
+		- 证明“文本→mel→waveform”两阶段端到端即可达到生产可用水平，为后续并行模型（FastSpeech 系列）奠定基准
+2. 引言核心
+	- 历史路线回顾
+		- 拼接合成：边界 artifact 严重
+		- 统计参数：流畅但 muffled，音质低于真人
+		- WaveNet：样本级音质接近真人，却需复杂 linguistic + F0 + duration 前端，领域门槛高
+	- Tacotron 局限
+		- 仅用 Griffin-Lim 重建，相位伪影明显，作者明示“只是占位” 
+	- Tacotron 2 统一方案
+		- 阶段 1: Tacotron-style seq2seq **直接生成 mel 频谱**（省去手工特征）
+		- 阶段 2：**改进 WaveNet** 以 mel 为条件，并行合成 24 kHz 波形
+		- 训练数据：仅<字符, 波形>对，无需任何文本分析或对齐标注
+	- 对标结果
+		- MOS 4.53 vs 专业录音 4.58，**首次在自然度上与人声无统计学差异**
+		- 相较 Deep Voice 3、Char2Wav，同等端到端路线，但音质明显领先，确立 mel+WaveNet 两阶段范式
+3. 中间表征：mel-spectrogram
+	- 为何选 mel 而非 linguistic/acoustic 特征
+		- 可直接由波形 STFT 计算，无需文本前端 → 两阶段可**独立训练**
+		- 相位被丢弃，帧内平滑，适合 L2 损失；比原始波形维度低、方差小，更易 seq2seq 学习
+	- mel 尺度优势
+		- 模仿人耳听觉：低频细节放大、高频压缩 → 对浊音/共振峰更敏感，摩擦噪声细节可适度模糊
+		- 几十年语音识别验证的紧凑表示，稳健性已保证
+	- 逆向挑战与可行性
+		- mel 比线性谱信息更少，逆变换更病态；但 WaveNet 类生成模型可在条件分布里“脑补”相位
+		- 实验证实：改进版 WaveNet 以 mel 为条件即可生成**高自然度**波形，从而把 mel 作为“桥梁”实现完全端到端训练
+4. 声谱预测网络细节
+	- mel 参数
+		- 50 ms 帧长 / 12.5 ms 帧移 / Hann / 2048 FFT
+		- 80-band mel 滤波 125 Hz–7.6 kHz，log 压缩前 clip 到 0.01，限制动态范围
+	- Encoder（简化版）
+		- 字符 512-D embedding → 3×conv-512-5×1 (BN+ReLU) → Bi-LSTM-512
+		- 去掉了 Tacotron1 的 CBHG，用 vanilla conv+LSTM，降低工程复杂度
+	- Location-Sensitive Attention
+		- 累加前步权重作 31×32 1-D conv 位置特征，防止重复/跳词
+		- 128-D 投影后加性打分
+	- Decoder（逐帧自回归）
+		- Pre-net 256→256 ReLU + dropout 0.5（瓶颈必需，否则学不到对齐）
+		- 2 层 uni-LSTM-1024 + attention context → 线性投影→ 80-D mel
+		- 并行停 token: sigmoid 0.5 阈值，动态决定结束位置
+	- Post-net（5 层 conv）
+		- conv-512-5×1 (BN+Tanh) ×4 → conv-80-Linear，预测残差叠加，减少谱重建误差
+	- 正则
+		- conv dropout 0.5 / LSTM zoneout 0.1 / 推断时仅 pre-net 用 dropout 做随机源
+	- 损失
+		- 帧级 L2（mel + 线性谱残差）等权； mixtures MDN 实验效果不及简单 L2
+5. WaveNet Vocoder 改进点
+	- 主干架构
+		- 30 层扩张卷积，3 个膨胀周期（1→2→4→…→512→1…）
+		- 条件网络：mel 帧 12.5 ms 步长 → **仅 2 层转置卷积上采样**（原 WaveNet 3 层），减少参数
+	- 输出分布
+		- 放弃 256-way softmax 离散桶
+		- 采用 **10 分量 Logistic 混合 (MoL)**，参考 PixelCNN++/Parallel WaveNet
+			- 每层输出 → ReLU → 线性投影 → 每分量 3 参数：mean、log-scale、mixture weight
+			- 负对数似然损失，直接对 16-bit 采样值回归，训练稳定、音质更高  
+	- 效果
+		- 参数量 ↓，推理速度 ↑，且 MoL 连续分布使合成信号噪声更小
+		- 与 mel 条件结合，实现“mel → 24 kHz 波形”高质量神经声码器，奠定后续 WaveGlow、MelGAN 等研究基础
+6. 训练流程与细节
+	- 两阶段独立训练
+		- 特征预测网络（seq2seq）
+			- teacher-forcing，batch=64，单 GPU
+			- Adam ($β1=0.9, β2=0.999, ε=1e-6$) 
+			- 50 k steps + L2 权重 $1e-6$
+		- 改进 WaveNet（神经声码器）
+			- 训练数据：阶段 1 **teacher-forcing 输出 mel**，与波形样本严格对齐
+			- batch=128 分跨 32 GPU 同步更新；Adam $lr=1e-4$ 固定
+			- 权重移动平均（EMA decay=0.9999）用于推理，提升稳定性
+			- 目标波形归一化 ×127.5，使 MoL 初始输出接近最终分布，加速收敛
+	- 数据集
+		- 内部 US English 24.6 h 专业女播音；文本全拼写（“16”→“sixteen”），无数字/缩写歧义
+	- 结果
+		- 两阶段互不干扰，可单独迭代；mel 条件使 WaveNet 参数量↓，仍达 MOS 4.53，奠定“mel+神经声码器”工业范式

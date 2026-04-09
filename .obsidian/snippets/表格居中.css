@@ -1,0 +1,23 @@
+.markdown-reading-view table {
+    margin: 1.5em auto !important;
+    width: auto !important;
+}
+
+/* 2. Live Preview / 源码视图 ------------------ */
+/*  旧版 CM5 源码 */
+.markdown-source-view:not(.mod-cm6) table {
+    margin: 1.5em auto !important;
+}
+
+/*  新版 CM6 Live Preview */
+.markdown-source-view.mod-cm6 .cm-content table {
+    margin-left: auto !important;
+    margin-right: auto !important;
+}
+
+/* 3. 强制不让主题覆盖（提高权重）------------- */
+body:not(.is-mobile) .markdown-reading-view table,
+body:not(.is-mobile) .markdown-source-view.mod-cm6 .cm-content table {
+    margin-left: auto !important;
+    margin-right: auto !important;
+}

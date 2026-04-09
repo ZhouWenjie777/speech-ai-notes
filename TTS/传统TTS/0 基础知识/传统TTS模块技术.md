@@ -1,0 +1,91 @@
+---
+data: 2026-01-04T11:42:00
+tags:
+---
+1. 传统级联 TTS 流程
+	- 四阶段：文本分析 → 韵律建模 → 声学建模 → 波形合成
+2. 文本分析模块
+	- 目标是将原始文本（如句子、段落）转化为机器可处理的 “结构化文本信息”
+	- 核心任务包括文本规范化、分词与词性标注、语法分析、韵律层级预测
+	- 文本规范化：Regex/FSM 把“2024-05-20”→“二零二四年五月二十日”；歧义用 NB/SVM 消歧
+	- 分词+词性：BiLSTM-CRF 切“我爱北京天安门”并标名词/动词
+	- 句法解析：PCFG 或 BiLSTM-dep 抽主谓宾，生成短语/依存树
+	- 韵律层级：CRF/LSTM 预测停延、重音、语调，输出三级标注  
+	- 特点：模块可解释、单点优化容易；错误级联累积，端到端正逐步替代
+3. 韵律建模模块
+	- 输入：文本分析给出的音素序列、词性、重音、停延标记
+	- 输出：三参数曲线
+		- 时长：每音素持续帧数（毫秒级）；重音/句尾边界额外延长 20-50%
+		- 基频 F0: Hz 级曲线，陈述句降、疑问句升；男女声覆盖 80-400 Hz
+		- 能量：帧级幅度，重音同步抬高，停延处归零
+	- 技术路线
+		- 规则法：手工表查时长、F0 模板，简单但风格单一
+		- 统计法：CART/GMM 映射文本特征→时长；HMM/GMM 逐帧离散预测 F0；多项式连续拟合整体趋势
+	- 现状：统计模型仍是工业级级联系统标配，端到端 Tacotron/Flow-TTS 已把三参数隐式合并入 mel 谱预测，逐步淘汰独立韵律模块
+4. 声学建模模块
+	- 任务：把韵律参数（时长、F0、能量）→ 帧级声学特征（MFCC/LPC/线谱对）
+	- 早期合成器
+		- 共振峰合成器：手工设定 F1/F2/F3 频率与带宽，机器人味重，已淘汰
+	- 统计建模（HTS 时代主流）
+		- 上下文相关 HMM：
+			- 核心思想：将声学特征的生成过程视为 “隐状态（音素）的转移过程”；每个音素对应多个隐状态（如 “起始、稳定、结束”），每个状态生成一个声学特征帧（如 MFCC）
+			- GMM 拟合 MFCC 观测；Baum-Welch 训练，Viterbi 解码取最优状态序列 → 特征帧
+		- 轨迹 HMM：联合建模静态+Δ+ΔΔ，减少帧间跳变，流畅度↑
+	- 局限：HMM 生成谱平滑，细节缺失；2016 后被 WaveNet/Tacotron 等神经梅尔谱生成器取代，但“韵律→声学”分离思想仍用于可控 TTS 前端
+5. 语音合成（波形生成）模块
+	- 输入：声学建模输出的帧级声学特征（MFCC）
+	- 输出：16 kHz/24 kHz 自然波形，决定最终听感
+	- 传统拼接法
+		- 单元挑选 & 拼接：在大语料库中按目标代价＋连接代价搜索最优基元序列，Viterbi 解码后 PSOLA 平滑拼接
+		- 优点：音质上限高，语料覆盖即可真人口感
+		- 缺点：库大（>2 GB）、边界伪迹难消除、无法出分布词汇
+	- 经典参数法
+		- 源-滤波器模型：LPC/STRAIGHT逐帧合成谱，脉冲/白噪激励 + 滤波器→波形
+		- 轻量（<50 MB），但“嗡嗡”金属声明显，F0 跳变处易出现颤音
+	- 神经声码器（2016+ 接管）
+		- WaveNet：自回归扩张 CNN，条件梅尔谱 → 16-bit 样本，MOS↑0.5
+		- WaveRNN：双 softmax 线性层，1.5 GMAC/帧，移动端实时
+		- HiFi-GAN: GAN 判别器驱动，1 kHz 级上采样，0.13 RTF，开源主流
+		- 趋势：梅尔谱作条件，神经声码器统一取代拼接与参数法，级联 TTS 四阶段至此全面神经化
+6. 传统级联 TTS 总结与局限
+	- 技术遗产
+		- 四模块流水线：文本→韵律→声学→波形，职责分离，可单点调优；
+		- 人工特征（音素、重音、F0）仍被端到端模型隐式复用
+	- 三大瓶颈
+		- 误差级联：前端分词/韵律错→后端无法自愈，自然度上限锁死
+		- 机械感：参数合成过平滑、拼接合成过依赖语料，情感与副语言信号缺失
+		- 成本高：需强制精标音素边界、F0、时长，专业工具+专家经验，开发周期长
+	- 结果
+		- 2017后端到端（Tacotron、VITS）直接 text→mel→wave，用数据暴力拟合，传统级联逐步退居嵌入式小 footprint 场景或作为前端先验提供可控性
+7. TTS 流程对照 & 入门路线
+	- 前端（文本 → 音素+韵律）
+		- 关键词：G2P、TN、多音字、韵律预测
+		- 学习路径
+			- 规则打底：用正则/FSM 实现英文 TN（数字、缩写）；中文可先调用 pypinyin + 手工纠错表
+			- G2P: CMU-dict 覆盖英文；中文用 open-dict「汉字-拼音-音素」10 万条快速构建查找表
+			- 数据驱动：将多音字、韵律边界做成序列标注任务，fine-tune BERT-CRF，开源代码参考 `espnet/espnet_tts_frontend`
+			- 速通资料
+				- CSDN博客：[TTS 中的文本前端](https://blog.csdn.net/weixin_43335465/article/details/145646936)
+				- `GitHub：espnet/espnet_tts_frontend`（中英双语规则集）
+	- 声学模型（音素 → mel/MFCC）
+		- 关键词：FastSpeech、Glow-TTS、VITS
+		- 学习路径
+			- 跑通 Baseline: LJSpeech 训练 FastSpeech1，掌握 length regulator 与 teacher-forcing 机制
+			- 进阶：Glow-TTS官方仓库（`jaywalnut310/glow-tts`）阅读 Monotonic Alignment Search 源码，理解流式对齐
+			- SOTA: VITS 官方仓库（`jaywalnut310/vits`），重点看 stochastic duration predictor 与 adversarial joint training 部分
+			- 速通资料
+				- 论文：FastSpeech (arXiv:1905.09263)、Glow-TTS (arXiv:2020.11106)、VITS (arXiv:2106.06103)
+				- 视频：YouTube 搜索 “VITS implementation walkthrough”  2 小时逐行讲解（频道名：TTS Research）
+	- 声码器（mel → 16-bit PCM）
+		- 关键词：HiFi-GAN、Vocos、BigVGAN
+		- 学习路径
+			- 原理：Mel 条件 GAN 的多周期/多尺度判别器，感受野 1024 样本
+			- 训练技巧：真值 mel + 噪声增强，discriminator 步数 :generator = 2:1，防止 mode-collapse
+			- 实时优化：Vocos 混合 GL+GAN，CPU 1.3×RT；BigVGAN 用 Snake 激活 + 大 kernel，GPU 0.08×RT  
+			- 速通资料
+				- HiFi-GAN 官方仓库：`jik876/hifi-gan`，含预训练 22 kHz 模型
+				- Vocos 论文与代码：`jungil-c/vocos`
+				- BigVGAN 论文：Large Scale Adversarial Training for End-to-End Speech Synthesis（arXiv:2206.04658）
+	- 一站式实验平台
+		- ESPnet-TTS：`config` 切换 FastSpeech2/Glow-TTS/VITS+HiFi-GAN，一条命令复现论文
+		- WeNet-TTS：中文前端+多音字+韵律端到端训练，支持 ONNX 导出嵌入式部署

@@ -1,0 +1,162 @@
+---
+data: 2026-01-08T16:16:00
+tags:
+---
+1. 文本正则化（`english_cleaners` 五步拆解，对应 `cleaners.py`）
+	- （1）`convert_to_ascii`
+		- 依赖 `unidecode` 库，把「`café`」→「cafe」、「中国」→「`Zhong Guo`」
+		- 目的：将文本转为`unicode`编码格式，后续处理只认ASCII，避免编码错位
+	- （2）`lowercase`
+		- 整句转小写，保证词典大小写唯一键
+	- （3）`expand_numbers`
+		- 采用正则表达式将文本中的数字转为英文单词
+	- （4）`expand_abbreviations`
+		- 将文本中的缩写转为全称
+	- （5）`collapse_whitespace`
+		- 去多余空格，将文本中的多个空格转为一个空格
+	- 完成上述的TN后，得到纯 `unicode` 编码下的可以直接转为 phoneme 序列的文本
+2. 摘要要点
+	- 端到端里程碑
+		- 直接以**字符**为输入，<text, audio> 配对即可从零训练，无需手工特征或分阶段 pipeline
+		- 输出**帧级** mel-spectrogram，再用 Griffin-Lim / WaveNet 转波形，推理比样本级自回归快得多
+	- 关键技巧
+		- 序列到序列 + Attention：解决字符→mel 长度不一
+		- 预网络 CBHG + 位置敏感注意力：提升对齐鲁棒性
+		- 损失设计：mel-L1 + 二元停止概率，支持任意长度语音
+	- 性能
+		- US English MOS 3.82（5 分制），**超越当时生产级参数系统**（3.67），首次证明端到端 neural TTS 可实用
+		- 为 Tacotron 2、Transformer-TTS、FastSpeech 等系列奠定基准框架
+3. 引言要点
+	- 传统级联痛点
+		- 前端→时长→声学→vocoder 独立训练，错误累积；特征工程繁重，适配新域成本高
+	- 端到端优势（Tacotron 目标）
+		- 字符→音频一对<text, audio>即可训练，无需音素对齐
+		- 条件输入（speaker、情感、语言）一次性喂给模型，无需逐模块传递
+		- 单模型更鲁棒，可直接利用大量 noisy 但表达丰富的公开数据
+	- 挑战
+		- TTS 是“高压缩→高维”逆问题：同文本可对应多种发音/风格，输出序列长度≈10×输入
+		- 连续输出 + 长序列 → 误差易累积， vanilla seq2seq 难以直接胜任
+	- Tacotron 应对
+		- seq2seq + Attention 框架，辅以 CBHG、Pre-net、位置敏感注意等技巧
+		- 随机初始化即可收敛，US English MOS 3.82，击败当时生产级参数系统（3.67），首次证明端到端 TTS 实用可行
+4. Tacotron 相关工作的对比定位
+	- WaveNet
+		- 样本级自回归，慢；需外部 TTS 前端提供语言学特征 → 仅替换 vocoder，非端到端
+	- DeepVoice
+		- 把传统模块全换成神经网络，但**各组件独立训练**，仍多阶段，难端到端
+	- Wang et al. 2016（最早 seq2seq TTS）
+		- 需预训练 HMM 对齐器辅助学习，对齐质量难控；
+		- 预测 vocoder 参数 → 仍需传统声码器；仅用音素，结果有限
+	- Char2Wav
+		- 字符输入，但仍预测 vocoder 参数 + 外接 SampleRNN；seq2seq 与 vocoder 需**分别预训练**
+	- Tacotron 差异化
+		- 字符→raw spectrogram，一次随机初始化端到端完成
+		- 无需对齐器、无需分模块需预训练、无需传统 vocoder（Griffin-Lim 即可）
+		- 针对字符级输入做了多项 seq2seq 改进（Pre-net、CBHG、位置敏感注意等），克服 vanilla 模型失败
+		- MOS 3.82，首次在自然度上击败生产级参数系统
+5. CBHG 模块结构（Tacotron 核心构建块）
+	- CBHG
+		- Convolution Bank + Highway network + Bidirectional GRU
+		- 即“1-D 卷积滤波器组 + Highway 网络 + 双向门控循环单元”的串联结构
+	- 设计目标
+		- 同时捕捉 n-gram 局部特征与双向长程上下文，替代传统 CNN/RNN 堆叠
+	- 管道流程（按顺序）
+		- Conv1D Bank
+			- K 组滤波器，第 k 组含 $C_k$ 个宽度=k 的 1D 卷积（$k=1…K$）
+			- 显式建模 uni/bi/…/K-gram 信息
+		- Max-Pool (stride=1) 
+			- 沿时间轴池化，窗口=2，步长=1 → 分辨率不变，局部不变性↑
+		- 固定宽度 Conv1D 堆叠
+			- 若干 3×1 卷积 + BN + ReLU，残差连接回池化后特征
+		- Highway Network (多层) 
+			- 把卷积输出压维 → 变换门/携带门机制，提取高层抽象
+		- Bidirectional GRU
+			- 最终双向门控循环，综合前后文序列信息
+	- 特性与改进点（vs Lee et al. MT 原版）
+		- 非因果卷积：可并行，适合 TTS 编码器
+		- stride=1 池化 + 残差 + BN：提升泛化，加深网络也不会梯度断裂
+	- 用途
+		- Tacotron 编码器 & 后处理网均用 CBHG 提取鲁棒表示
+		- 后续被 Transformer 取代，但仍常作轻量级编码器
+6. Tacotron 编码器（Encoder）细节
+	- 输入
+		- 字符 one-hot → 256-D 字符嵌入
+	- Pre-net（瓶颈层 + Dropout）
+		- FC-256-ReLU → Dropout(0.5) → FC-128-ReLU → Dropout(0.5) 
+		- 作用：降维、抑制过拟合、加速收敛
+	- CBHG 编码器
+		- 配置：K=16 1-D conv bank → max-pool(stride=1) → 2×conv-3-128 → 残差 → 4 层 highway-128 → Bi-GRU-128
+		- 效果：相比单纯堆叠 RNN，**误读率↓**，泛化更好，长句鲁棒性↑
+	- 输出
+		- Bi-GRU 最终隐藏状态序列，作为 Attention 的“记忆”向量供解码器查询
+	- 整体流
+		- 字符 → embedding → pre-net → CBHG → context-aware phoneme-level representations → Attention
+7. Tacotron 解码器关键设计
+	- 注意力机制
+		- 内容型 tanh 注意力（Location-sensitive）
+		- 每步由 Attention RNN 生成 query，与 encoder 输出计算权重计算context 向量
+	- 解码栈（垂直残差 GRU）
+		- 2 层 GRU-256，残差连接，收敛更快
+		- 输入：context + Attention RNN 输出拼接
+	- “一次发 r 帧”技巧（reduction factor）
+		- 每步同时预测 r=2 帧非重叠 mel，总解码步数减半
+		- 效果：
+			- 模型更小、训练/推理更快
+			- 相邻帧高度相关，多发帧允许attention提前前移，**对齐学习速度↑，更稳**
+	- 解码流程（训练 vs 推理）
+		- 训练：每步喂入**第 r 帧真值**作为下一步输入（teacher-forcing）
+		- 推理：每步喂入**上一步第 r 帧自回归预测**作为下一步输入（无调度采样，dropout 当噪声源）
+	- Pre-net 与 Dropout
+		- 同 encoder: FC-256-ReLU→Dropout(0.5)→FC-128-ReLU→Dropout(0.5) 
+		- 无调度采样情况下，dropout 是**唯一噪声源**，防止输出多模态塌陷，保证音质
+8. Tacotron 解码器整体流（step-by-step）
+	- 初始化
+		- t = 0，输入全零 \<GO\> 帧（80-D mel）
+	- 每步循环（训练/推理差异见下方）
+		- a. Pre-net
+			- FC-256-ReLU → Dropout(0.5) → FC-128-ReLU → Dropout(0.5)  
+		- b. Attention RNN（1层 GRU-256）
+			- 输入：pre-net 输出 + 上一步 context
+			- 输出：query 向量  
+		- c. Location-sensitive Attention
+			- query 与 encoder 全部隐状态打分 → 权重 → context 向量 cₜ 
+		- d. 解码栈（2层残差 GRU-256）
+			- 输入：cₜ ⊕ Attention-RNN 输出
+			- 输出：隐藏 hₜ  
+		- 线性投影
+			- hₜ → 同时预测 r=2 帧 mel（共 160-D）
+			- 额外分支：停止概率（判断是否结束）
+	- 下一步输入
+		- 训练：用第 r 帧**真值**喂回 Pre-net（teacher-forcing）
+		- 推理：用第 r 帧**自回归预测**喂回 Pre-net（无调度采样，dropout 当噪声）
+	- 直到生成停止 token 或达到最大步数 → 得到 mel 序列 → Post-net(CBHG) 精修 → Griffin-Lim → 波形
+9. Tacotron 后处理 + 波形合成
+	- Post-processing Net（CBHG）
+		- 输入：seq2seq 输出的 80-band mel
+		- 结构：K=8 CBHG → 输出线性频率 80-band 幅度谱
+		- 作用：
+			- 把 mel 转成 Griffin-Lim 可用的线性谱
+			- 利用双向 GRU“全局视野”修正帧级误差，减少盲解码累积
+	- Griffin-Lim 波形重建
+		- 幅度谱 raise 1.2 次幂 → 增强谐波，抑制 Gl 伪影
+		- 迭代 50 次（30 次已足够）→ 收敛快，CPU/GPU 均 < 50 ms
+		- TensorFlow 原生实现，可微但**无梯度损失**，仅推理用
+	- 总结
+		- 后处理网络是“通用槽”：可换 vocoder 参数、WaveNet、神经声码器；Griffin-Lim 只是最简单 baseline
+		- 整套流程：字符 → seq2seq mel → CBHG 线性谱 → Griffin-Lim → 波形，端到端训练，无需任何手工特征
+10. Tacotron 训练细节与实用技巧
+	- 声谱参数
+		- 24 kHz 采样；预加重 0.97
+		- STFT: 50 ms帧长 / 12.5 ms帧移 / Hann窗 / 2048 点 FFT →log-magnitude
+	- 输出设置
+		- reduction factor r = 2（每步发 2 帧 mel）；更大 r 也能用
+		- 目标：80-band mel（seq2seq）+ 80-band linear（post-net），两路 L1 损失权重 1:1
+	- 优化器
+		- Adam，初始$lr=1e-3$；$500k,1M,2M$步时依次降到$5e-4, 3e-4, 1e-4$
+	- 批次与填充
+		- batch=32，按最大长度补零
+	- **关键 trick：不掩零填充帧**
+		- 若用 loss-mask 忽略补零部分，模型不知何处停止 → 尾音重复/拖尾
+		- 简单对策：**也让模型重建补零帧**（即计算全长 L1），解码器自然学会在零幅区停声，显著减少尾重复现象
+	- 总结
+		- 零填充也重建是 Tacotron 原始实现里“小而有效”的收敛窍门，后续端到端模型普遍沿用

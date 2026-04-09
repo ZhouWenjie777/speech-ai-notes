@@ -1,0 +1,150 @@
+---
+data: 2026-01-25T21:19:00
+tags:
+---
+1. 摘要要点
+	- 任务：条件音乐生成（文本/旋律 → 音乐）
+	- 痛点
+		- 级联方案：分层或上采样多模型 → 误差累积、延迟高
+	- 方案
+		- 单级 Transformer LM：一次完成所有 token 生成
+		- 多流压缩离散表示：旋律、立体声、文本条件统一 token 化
+		- 高效交错模式：并行解码，无需额外上采样
+	- 控制方式
+		- 文本描述：自然语言指定风格/乐器
+		- 旋律条件：给定旋律 token → 生成配器与和声
+	- 结果
+		- 自动+人工评测：标准文本-音乐基准优于级联基线
+		- 支持 mono/stereo 高质量采样
+	- 开源：代码+模型+样例已放 `GitHub facebookresearch/audiocraft` 
+2. 引言要点
+	- 音乐生成难点
+		- 长序列：44.1/48 kHz vs 语音 16 kHz，全频段建模
+		- 多声部：和声、旋律、乐器并行，人耳对不和谐极度敏感
+		- 强控制需求：调性、乐器、风格、旋律等需细粒度操作
+	- 现有方案
+		- 多离散 token 流 → 高质量，但需联合建模多流依赖
+		- 并行延迟流 \[`Kharitonov`'22\]、层级自回归 \[`Agostinelli`'23\]、两阶段+NAR 后网络 \[Wang'23\]
+		- 共通痛点：级联复杂、延迟高、对齐难
+	- MusicGEN 创新
+		- 单级 LM 完成多流建模
+			- 通用 codebook 交错框架（Flattening / Parallel / Coarse-First / Delay 四种模式，见图 1）  
+			- 32 kHz 直接输出，无需上采样或分层
+		- 单模型双条件
+			- 文本描述 + 无监督旋律条件 → 一次生成即与和弦结构对齐且忠实文本
+		- 立体声零额外成本
+			- 并行流天然支持 stereo，不增计算量
+	- 结果
+		- 主观 MOS：84.8 vs 最强基线 80.5（↑4.3）
+		- 人类评估：旋律一致性、文本忠实度均优于级联方案
+		- 开源代码+模型+音频样例
+3. 方法总览 & Audio Tokenization 要点
+	- 整体框架
+		- 单级自回归 Transformer decoder，条件为文本或旋律表示
+		- 建模对象：EnCodec 离散 token（RVQ 多码本）
+	- EnCodec 音频 token 化
+		- 卷积自编码器 + 残差向量量化（RVQ）
+		- 输入：音频 $\mathbf X\in\mathbb R^{d\times f_s}$  
+		- 输出：连续 latent $\to$ 帧率 $f_r \ll f_s$，再量化为 $K$ 条并行离散序列，长度 $T=d\cdot f_r$
+		- 码本重要性递减：第 1 条序列（codebook-0）承载主要能量，后续码本补量化误差
+		- 重建：对抗损失保证 32 kHz 高保真
+	- 后续步骤
+		- 用“码本交错模式”将 $K$ 条并行序列压成 1 条 AR 可建模序列
+		- 条件分支：文本描述 or 旋律 token → 控制生成
+		- 同一模型直接输出立体声，无需额外上采样网络
+4. Codebook Interleaving Patterns 要点
+	- 动机
+		- RVQ 每帧含 $K$ 个并行码本，AR 只能逐 token 建模 → 需把“并行”变“串行”
+	- 精确分解（Flattened）
+		- 按码本-时间拉平：$S = d f_r K$ 步，理论上可完美拟合真实分布 $p$，但序列长度$\times K$，训练/推理慢
+	- 非精确分解（Inexact）
+		- 每步同时预测同一帧的 $K$ 个码本（Parallel 模式）或带偏移（Delay 模式），保持原帧率 $T = d f_r$
+		- 条件独立假设：$P(V_{t,k}\mid V_{<t}) \approx P(V_{t,k}\mid V_{t-1})$，误差随 $t$ 累积，但速度$\times K$ 提升
+	- 通用框架：Codebook Pattern
+		- 定义位置集合 $\Omega = \{(t,k)\}$，模式 $P = (P_0,\dots,P_S)$ 为 $\Omega$ 的划分，每步并行预测 $P_s$ 内全部 $(t,k)$  
+		- 限制：同一码本 $k$ 在单步 $P_s$ 最多出现一次 → 保证并行可执行
+	- 实例模式（见图 1）
+		- Parallel：$P_s = \{(s,k) \mid k=1\dots K\}$
+		- Delay：$P_s = \{(s-k+1,k) \mid k\le s\}$，码本 $k$ 延迟 $k-1$ 步
+		- Coarse-First：先预测低码本序号，再向上细化
+	- 经验结论
+		- 精确 Flattened 质量最高，但长序列代价大；
+		- Parallel+Delay 在 32 kHz 立体声场景 `BLEURT` 仅下降 0.4，速度提升 3.8×，被选为默认模式
+5. Model Conditioning 要点
+	- 文本条件三路对比（均实验）
+		- T5 编码器：冻结预训练，输出句向量 $\mathbf h_{\text{T5}}$
+		- FLAN-T5：指令微调版，相同维度，主观 MOS ↑0.9
+		- CLAP 联合嵌入：文本-音频共享空间，余弦相似度 $\cos(\mathbf e_{\text{text}},\mathbf e_{\text{audio}})$ 作为条件，`BLEURT` ↑1.2，最终选 CLAP
+	- 旋律条件（无监督）
+		- 输入：任意音频/哼唱 $\mathbf X$ → 常数 Q 变换 → 色谱图 $\mathbf C\in\mathbb R^{T\times F}$
+		- 信息瓶颈：每帧取能量最大 bin，得 1-hot 向量 $\mathbf m_t=\arg\max_f C_{t,f}$，降维防复制
+		- 条件融合：$\mathbf m$ 与 CLAP 文本向量拼接后过线性投影 $\mathbf W_c$，送入 Transformer 交叉注意
+		- 优势：无需配对“旋律-伴奏”监督数据，零成本扩展迭代精修
+6. 模型架构要点
+	- Codebook 投影与位置编码
+		- 每步模式 $P_s$ 仅含部分码本；存在则查表 $\mathbf E_k\in\mathbb R^{N\times D}$，不存在用特殊嵌入 $\mathbf e_{\text{abs}}$ 
+		- 输入向量：$\displaystyle\mathbf x_s=\sum_{k\in P_s}\mathbf E_k[q_{t,k}]+\mathbb I_{k\notin P_s}\mathbf e_{\text{abs}}+\text{sin\_pos}(s)$  
+		- $q_{t,k}$ 为量化索引；$\text{sin\_pos}$ 同 Transformer 正弦位置嵌入
+	- Transformer Decoder（$L$ 层，维数 $D$）
+		- 因果自注意力
+		- 交叉注意力：条件 $\mathbf C$（CLAP 文本向量或旋律瓶颈 $\mathbf m$）；旋律条件时 $\mathbf C$ 直接作为前缀拼接
+		- FFN：$\text{Linear}_{D\to 4D}\to\text{ReLU}\to\text{Linear}_{4D\to D}$，残差+pre-norm
+	- Logits 预测
+		- 每层输出 $\mathbf h_s\in\mathbb R^D$ 经码本专属线性层 $\mathbf W_k\in\mathbb R^{D\times N}$ 得 logits $\mathbf l_k=\mathbf W_k\mathbf h_s$  
+		- 仅对 $P_{s+1}$ 出现的码本计算 softmax，预测下一量化索引  
+		- 总参数量 $\approx L(D^2+4D^2+KN\cdot\text{share})$
+7. 实验设置要点
+	- 音频 token 化
+		- EnCodec: 5层非因果，stride=640，帧率50 Hz，隐层 64→ 128→ 256→ 512→ 1024
+		- RVQ: 4 个量化器，码本大小 2048，总压缩率≈45×
+		- 训练：随机 1 s 片段，MSE+对抗损失
+	- Transformer 模型
+		- 规模：300 M/1.5 B/3.3 B 参数；层数/维度：{24,1024}/{36,1536}/{48,2048}
+		- Flash Attention + float16，梯度裁剪 1.0；cosine LR，warmup 4 k 步，EMA 0.99；采样：top-k=250，温度 1.0，CFG  Guidance Scale=3.0
+	- 训练细节
+		- 数据：30 s 随机裁剪，1 M 步，batch=192（≈1.6 h 音频/步）
+		- 优化器：AdamW β=(0.9,0.95)，权重衰减 0.1
+		- 300 M 用 D-Adaptation 自动步长；大模型手动 1e-4 → 3e-5 衰减
+	- 文本预处理
+		- text-normalization：去停用词 + 词形还原
+		- condition-merging：拼接 key/tempo/乐器标签，概率 0.25
+		- text dropout：描述丢弃 0.5，word dropout 0.3（防过拟合）
+	- 条件设置
+		- 码本模式：Delay 式，30 s → 1500 AR 步
+		- 文本编码：默认 T5，对比实验含 FLAN-T5 / CLAP
+		- 旋律条件：窗口 $2^{14}$，hop $2^{12}$，argmax 量化，无监督提取
+		- Classifier-Free Guidance：训练条件丢弃概率 0.2，推理 scale=3.0
+8. Related Work 要点
+	- 音频表示
+		- 离散：k-means VQ \[`Lakhotia`’21\] → EnCodec/RVQ \[`Défossez`’22, `Zeghidour`’21\]
+		- 连续：潜扩散潜空间 \[`Schneider`’23, `Huang`’23 b\]
+	- 音乐生成
+		- 符号域：GAN \[`Dong`’18\]、无监督分段 \[`Bassan`’22\]、RNN 多声部 \[`Ycart`’17\]
+		- 声学域 token
+		    - 层次 VQ-VAE + 稀疏 Transformer \[`Dhariwal`’20\]
+		    - 语义+声学 token 级联 AR \[`Agostinelli`’23\]
+		    - 唱→伴奏 AR \[`Donahue`’23\]
+		- 扩散路线
+		    - 潜扩散端到端 text-to-music \[`Schneider`’23, `Huang`’23 b, `Maina`’23\]
+		    - Stable-Diffusion 微调声谱图 + 图像-到-图像拼接长序列 \[`Forsgren-Martiros`\] 
+	- 通用音频生成（环境声）
+		- VQ-VAE 声谱图 + 离散扩散 \[`Yang`’22\]
+		- EnCodec token + AR Transformer \[`Kreuk`’22\]
+		- 潜扩散扩展修补/图-到-音频 \[`Huang`’23 a, `Liu`’23\]
+	- 本文差异
+		- 单级 AR Transformer 同时建模多码本 token，无需级联或扩散
+		- 统一支持文本/旋律条件，立体声不增计算成本
+9. Discussion 要点
+	- 核心贡献
+		- 单级 AR + 码本交错 →  stereo 32 kHz 高质音乐，步数比 Flattening ↓K 倍
+		- 系统消融：模型尺度、条件方式、文本预处理全维度 benchmark
+		- 无监督色谱旋律条件，零配对数据实现迭代精修
+	- 局限
+		- 细粒度控制不足
+			- 仅靠 CFG 强度调节，无法硬约束小节/和弦走向
+		- 音频条件数据增强待研究
+			- 文本可 dropout，旋律参考尚无有效增广策略
+	- 伦理与影响
+		- 数据合法：与 `ShutterStock` 签正式协议，确保版权清洁
+		- 多样性缺口：数据集以西方音乐为主，后续需扩容非西方风格
+		- 艺术家竞争：开源模型+高级控制（旋律条件）可降低门槛，让业余与专业人士平等使用

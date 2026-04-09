@@ -1,0 +1,61 @@
+---
+data: 2025-12-19T15:26:00
+tags:
+---
+1. RTTI（1）——typeid 与 type_info
+	- 头文件：
+		- `#include <typeinfo>` 提供 `typeid` **运算符**与 `std::type_info` **类**
+	- typeid 语法
+		- 一元运算符，接受**类名**或**表达式**
+		- 返回对 `const std::type_info` 的引用；生命周期贯穿程序全程，可安全比较/存储
+		- 示例
+			- `double y = 3.14;`
+			- `cout << typeid(y).name();        // 表达式`
+			- `cout << typeid(Report).name();   // 类名`
+	- type_info 接口
+		- `const char* name() const noexcept;` 返回实现定义的类名字符串（GCC/Clang 返回 mangled 名，MSVC 返回可读名）
+		- 不可拷贝、不可移动、不可手动构造，只能由  typeid  取得
+	- 动态 vs 静态类型
+		- 对非多态类型（无 virtual 函数） typeid(表达式)  在编译期决定，结果 = 静态类型
+		- 对多态类型（有 virtual 函数） typeid(表达式)  在运行期取动态类型（最底层派生类）
+		- 示例
+			- `Report* p = new RR;           // 静态类型 Report*，动态类型 RR*`
+			- `cout << typeid(*p).name();    // 输出 RR（运行时决定）`
+			- `cout << typeid(p).name();     // 输出 Report*（指针本身类型）`
+	- 典型用途
+		- 调试日志：打印对象真实类型
+		- 工厂函数：根据 type_info 做类型→创建器映射
+		- 与 `dynamic_cast`配合：先`typeid`比较确认可转换，再执行`dynamic_cast`避免失败开销
+	- 性能注意
+		- typeid 对多态类型需一次虚表指针跳转，成本远低于异常，但比虚函数略高
+		- 对非多态类型在编译期完成，零额外开销
+	- 可移植性
+		- `name()`返回字符串由实现决定（mangled 或可读），不应作为业务逻辑依据，仅用于日志/调试；跨平台比较请用`operator==`而非字符串比对
+	- 与异常体系结合
+		- 在`catch(const std::exception& e)`分支内可用`typeid(e)`判断实际派生类型，实现“多态异常”的精细处理
+2. RTTI（2）——dynamic_cast
+	- 语法
+		- `dynamic_cast<目标类型>(表达式)`
+		- 目标类型必须是**指针或引用**，且涉及多态类（有虚函数）；转换失败时：
+			- 指针版 → 返回 **nullptr**
+			- 引用版 → 抛出 **std::bad_cast**
+		- dynamic_cast 让“非法交叉转换”在运行期可检测，而非静默 UB
+	- 合理性判定
+		- 向上（up-cast）：派生类 → 基类，总是安全，直接隐式转
+		- 向下（down-cast）：基类 → 派生类，可能失败，必须用`dynamic_cast`才能在运行时检查是否合法
+		- dynamic_cast只能在”源指针**指向实际对象**同目标指针同类型（向下）“或”源指针是目标指针的派生类（向上）“时成功，一般用来判断是否可以安全地将基类地址转换成派生类地址
+	- 使用限制
+		- 基类必须多态（至少一个虚函数），否则编译错误
+		- 仅在开启 RTTI 时有效；VS 旧版需在项目属性 → C/C++ → 语言 → 启用运行时类型信息 = 是
+		- 不能转换到/从 `void*`，也不能在非多态类型间横向转换
+	- 与 typeid 配合
+		- 先`typeid(*pg) == typeid(Magnificent)`再`dynamic_cast<Magnificent*>`可避免一次失败分支
+		- 但`typeid`无法区分“派生侧”层次，`dynamic_cast`才能安全导航继承树
+	- 性能提示
+		- 需要一次虚表指针跳转 + 运行时查表，成本略高于虚函数调用，但远低于异常；对性能极敏感路径可先用`typeid`快速过滤
+	- 最佳实践
+		- 向下转换前总是判空（指针转换）：`if (Derived* d = dynamic_cast<Derived*>(base)) {...}
+		- 引用转换用`try-catch`
+			- `try { auto& r = dynamic_cast<Derived&>(base); }`
+			- `catch (std::bad_cast&) { /* 处理失败 */ }`
+		- 优先用虚函数消除转换需求；不得不用时，`dynamic_cast`是最安全、最可维护的向下转换工具

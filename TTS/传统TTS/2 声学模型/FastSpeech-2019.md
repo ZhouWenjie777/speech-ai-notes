@@ -1,0 +1,89 @@
+---
+data: 2026-01-06T15:34:00
+tags:
+---
+1. 核心贡献
+	- 问题瞄准
+		- 自回归 TTS（Tacotron 2、Transformer-TTS）质量高，但推理逐帧生成，慢且易跳字/重复
+		- 缺乏显式时长控制，难以平滑调节语速或韵律
+	- 解决思路
+		- 先训练一个“教师”自回归模型，提取 encoder-decoder 注意力对齐 → 得到每帧音素时长
+		- 用时长预测器 + Length Regulator 把音素序列一次扩展到目标帧数，实现非自回归并行生成
+	- 网络结构（Feed-Forward Transformer）
+		- Encoder：音素 → 隐藏状态
+		- Length Regulator：按预测时长复制隐藏状态，一步展开到 mel 帧长
+		- Decoder：展开后的序列 → 并行输出 mel-spectrogram
+		- 可选 Pitch/Energy 预测器，提供细粒度 prosody 控制
+	- 实验结果（LJSpeech）
+		- 音质与自回归持平（MOS ~4.0）
+		- 鲁棒性：几乎消除跳字/重复
+		- 速度：mel 生成加速 270×，端到端（+WaveNet vocoder）38×
+		- 语速调节：仅改时长预测器输出，0.5×–2× 连续可变，无额外重训练
+	- 后续影响
+		- 奠定“教师提取时长 → 非自回归学生”范式，催生 FastSpeech 2、SpeedySpeech、Glow-TTS 等
+		- 时长预测器成为现代 TTS 前端标配，支持细粒度可控合成
+2. 动机
+	- 自回归 mel 生成三大痛点
+		- 慢：序列长度500~2000帧，须逐帧条件生成，Transformer亦无法并行推理
+		- 不稳：文本语音attention错帧 → 跳词/重复，难回退
+		- 难控：逐帧生成，时长、停顿、重音隐式耦合，想调语速只能重新训模型
+	- 关键观察：单调对齐
+		- 文本→语音的对应是单调的，每音素持续若干帧，天然“时长”概念
+		- 若能先知晓“每音素几帧”，即可一次把音素序列 upsample 到 mel 长度，再并行解码
+	- FastSpeech 解法
+		- 阶段 1：自回归 Teacher（Transformer-TTS）训练完毕，提取 encoder-decoder attention 得到硬时长
+		- 阶段 2：Student 为纯前馈网络，输入音素，用 Length Regulator 按时长复制隐藏状态，随后并行 mel 输出
+		- 结果：推理$O(1)$步数完成整条 mel，且时长可任意缩放，误差不会自回归累积
+3. 背景梳理
+	- TTS 演进回顾
+		- 拼接 → 统计参数 → 神经网络参数 → 端到端自回归（Tacotron 2、Transformer-TTS、ClariNet）
+		- 端到端质量逼近真人，但 mel 生成依旧逐帧自回归，成为速度 & 鲁棒瓶颈
+	- 非自回归（NAR）序列生成进展
+		- NLP：NAT、Transformer-NAT 在机器翻译上实现并行解码，加速 10–15×
+		- 音频：Parallel WaveNet、ClariNet、WaveGlow 并行生成波形，**条件仍是自回归 mel**，前端延迟未解决
+	- FastSpeech 定位
+		- 首次把“并行生成”切入 mel-spectrogram 阶段，而非仅波形阶段
+		- 用「硬时长」替代「软 attention」，既提速又几乎消除跳词/重复；参数量 ≈ 教师模型，推理 270× 快于自回归 Transformer
+		- 与同期 NAR-mel 工作`[17]`相比：后者保留 encoder-decoder+attention，参数量 2~3×，仍不能完全解决鲁棒性问题
+4. 模型总览
+	- 整体流水线
+		- Phoneme Embedding →  N×FFT blocks  (phoneme side) → Length Regulator → N×FFT blocks (mel side) → Linear → mel-spectrogram
+	- FFT Block 结构
+		- 多头自注意力：捕获全局依赖
+		- 2层 1D-CNN (kernel=3, ReLU)：利用语音局部平滑性，取代 Transformer 原前馈层
+		- 残差 + LayerNorm + Dropout，保持一致的可训练深度
+	- Length Regulator
+		- 输入：phoneme 隐藏状态 $h_1,\dots ,h_n$ 
+		- 时长预测器给出每音素帧数 $d_i\in\mathbb{R}$（训练用教师硬对齐，推理可$\times$速度系数）
+		- 按 $\lceil d_i \rceil$ 复制 $h_i$，一步展开到 mel 长度，并行进入后续 FFT
+	- Duration Predictor
+		- 2$\times$(1D-CNN + LN + ReLU) + Linear；输出 scalar
+		- 仅训练阶段用 MSE 与“教师”提取的硬时长对齐；推理阶段完全并行，无自回归
+5. Length Regulator 细节与语速控制
+	- 输入输出
+		- 输入：phoneme 隐藏序列 $H_{\text{pho}}=[h_1,\dots ,h_n]$
+		- 时长：$D=[d_1,\dots ,d_n]$，满足 $\sum d_i=m$（目标 mel 帧数）
+		- 输出：$H_{\text{mel}}=\text{LR}(H_{\text{pho}}, D, \alpha)$，长度 $\approx \alpha{\cdot}m$
+	- 复制策略
+		- 对每 $h_i$ 连续重复 $\lceil \alpha d_i \rceil$ 次，再按顺序拼接
+		- 例：$\alpha=1,\ D=[2,2,3,1]\Rightarrow$ 展开 $[h_1^2,h_2^2,h_3^3,h_4^1]$，总帧数 8
+	- 语速调节
+		- $\alpha=1.3$（慢速）：$\lceil 1.3\,d_i \rceil$ 整体加长，总帧数 $\approx 1.3m$
+		- $\alpha=0.5$（快速）：同理缩短；改变仅发生在时长预测值，无需重训模型
+	- 韵律微调
+		- 把空格字符也视作 phoneme，对其 $d_{\text{space}}$ 手动加减，可增大/减小句间停顿
+		- 实现“加停顿”式重音或节奏控制，而无需改动主网络
+6. Duration Predictor 与教师对齐提取
+	- 网络结构
+		- 2 × (1D-CNN + ReLU + LayerNorm + Dropout) 
+		- 末端 Linear 输出每音素对数时长 $\log d_i$（标量）
+		- 训练损失：$\mathcal{L}_{\text{dur}} = \text{MSE}\bigl(\log\hat{d}_i,\ \log d_i^{\text{teacher}}\bigr)$  
+	- 教师硬对齐提取流程
+		- a. 先训练常规自回归 Transformer-TTS（encoder-attention-decoder） 
+		- b. 对每个样本取 decoder→encoder 多头注意力矩阵 $\mathbf{A}\in\mathbb{R}^{S\times T}$ 
+		- c. 计算每个头“聚焦率”$F = \max_s A_{s,t}$ 的平均，选 $F$ 最大的头作为单调对齐
+		- d. 统计该头每列 $t$ 的非零行数，即音素 $t$ 对应的 mel 帧数，得到真值时长 $D=[d_1,\dots,d_T]$  
+		- 注：越接近纯正对角，聚焦率越接近1；简而言之，用「每列最大 attention 值的平均」作为衡量对角程度的指标，挑最对角的头
+	- 使用阶段
+		- 训练：用教师 $D$ 监督 Duration Predictor，同时展开 Length Regulator → 并行 mel 解码
+		- 推理：不再依赖教师，直接用预测 $\hat{d}_i$（可×速度系数 $\alpha$）完成展开，实现完全非自回归合成

@@ -1,0 +1,120 @@
+---
+data: 2026-01-06T19:44:00
+tags:
+---
+1. 核心改进
+	- 去掉教师-蒸馏流水线
+		- FastSpeech 依赖教师模型蒸馏 mel 目标 → 信息损失
+		- FS2 直接用**真实 mel-spectrogram**训练，简化流程并保留细节
+	- 显式变分输入（解决一对多映射）
+		- 从波形提取**时长 + 基频 + 能量**作为条件，训练阶段喂真值，推理阶段用预测器输出
+		- 三者均音素级对齐，模型只需学习“确定性”映射，减轻数据简化带来的模糊
+	- 训练提速
+		- 省去教师训练 + 蒸馏阶段，整体训练时间缩短 **3×**
+	- FastSpeech 2s（首次并行波形生成）
+		- 在 FS2 基础上把 vocoder 并入，用类似 Parallel WaveGAN 的对抗声码器思路，**文本→波形一步并行**
+		- 推理进一步加速，且完全端到端
+	- 结果亮点
+		- FS2 音质**超过教师蒸馏版 FS**，与自回归 Transformer 打平甚至略优
+		- FS 2s 实时因子 **< 0.1**，首次实现“可部署级”并行神经 TTS
+2. 贡献拆解
+	- 训练流程瘦身
+		- 去掉「教师训练 + 蒸馏」两阶段，直接以真实 mel 为目标 → 训练时间缩减 3×，实现更简单的单阶段 pipeline
+	- 信息缺口补齐（缓解一对多，即同一段文本 → 对应无数种合理语音）
+		- 输入侧追加三大条件：duration、pitch、energy，均从波形提取
+		- 模型只需学习「文本 + 三大显式变异」→ 确定 mel，降低数据简化带来的模糊性
+	- pitch 建模升级
+		- 将时域 F0 轮廓用连续小波变换 (CWT) 转成 10-bin  pitch spectrogram，在频域预测
+		- 相比直接回归标量 F0，CWT 能捕捉大幅波动，预测精度 ↑，韵律更自然
+	- FastSpeech 2s —— 并行 waveform 生成
+		- 取消 mel 中间表示，文本 → 声学特征 → 对抗声码器一体输出波形
+		- 推理延迟进一步降低，首次实现「完全并行 + 完全端到端」神经 TTS
+	- 实验收益
+		- 音质：FS2 MOS 超过教师蒸馏版 FS，与自回归 Transformer 持平甚至略优
+		- 速度：FS 2s RTF < 0.1，GPU 上单句 0.02 s 级完成
+		- 可控性：duration、pitch、energy 三轴可独立调节，无需重训练
+3. 动机
+	- 一对多映射问题
+		- 同一段文本可对应多种合理语音（语速、音高、能量、情绪等）
+		- 非自回归模型若仅输入文本，目标模糊，易平均化或过拟合
+	- FastSpeech 遗留痛点
+		- 教师-蒸馏两阶段：训练繁琐，蒸馏 mel 丢失细节，音质上限受限
+		- 教师 attention 提取的时长不准，进一步放大对齐误差
+	- FastSpeech 2 核心改进
+		- 去掉教师-蒸馏
+			- 直接以真实 mel 为目标，信息无损失，训练阶段缩减 3×
+		- 强制对齐替代 attention 时长
+			- 用 **Montreal-Forced-Aligner** (MFA) 生成帧级音素边界，精度 > teacher attention，duration MSE↓约 30%
+		- Variance Adaptor 三预测器
+			- Duration Predictor：MFA 时长 → MSE 损失
+			- Pitch Predictor：CWT-F0 频谱 → L1 损失
+			- Energy Predictor：帧级 L2-norm → L1 损失
+			- 训练时三值作为条件输入，推理时自回归预测；随机 dropout 增强鲁棒
+		- 条件控制
+			- 时长、pitch、energy 三轴可独立缩放（如 α=1.3 语速），无需重训模型
+	- FastSpeech 2s —— 并行 waveform 生成
+		- 取消mel解码器，换对抗波形解码器，文本→隐变量→类 HiFi-GAN 生成器直接输出 PCM
+		- 实现 phoneme→waveform 全并行，GPU 上 RTF < 0.08，首版即达部署级延迟
+4. Variance Adaptor 细节
+	- 统一网络结构
+		- 三个预测器同形不同参：2×(1D-CNN + ReLU → LN + Dropout) + Linear
+		- 输入：phoneme 隐藏序列；输出：各自目标序列
+	- Duration Predictor
+		- 目标：MFA提取的帧级音素时长 → $\log$ 域 MSE
+		- 推理：$\hat{d}_i$ 可×速度系数 $\alpha$，控制语速
+	- Pitch Predictor
+		- 连续小波变换 CWT 将 F0 轮廓分解为 10-bin pitch spectrogram，频域 MSE
+		- 推理：预测 spectrogram → inverse CWT 还原 F0；再 log-quantize 到 256 级→嵌入向量 $\mathbf{p}$
+	- Energy Predictor
+		- 目标：STFT 帧 L2-norm→256 级均匀量化；预测器输出实值，MSE 损失
+		- 嵌入向量 $\mathbf{e}$ 与 $\mathbf{p}$ 同样逐帧加到展开后的隐藏序列
+	- 条件流程
+		- 训练：真值时长、基频、能量作为输入条件，模型学习「文本+变异→真实mel
+		- 推理：自回归预测 $d,\text{CWT-F0},\text{energy}$，再展开/嵌入，实现可控合成
+	- 总结
+		- MFA → 给出「音素 ↔ 帧」边界，用来计算 duration 真值
+		- CWT → 把原始 F0 轮廓转成 pitch spectrogram，作为 pitch 真值
+		- STFT → 算每帧幅度 L2-norm，得到 energy 真值
+		- 三者都是在训练前一次性从语音波形提取的静态标签，供对应预测器监督学习
+5. FastSpeech 2s 设计要点
+	- 挑战
+		- 波形含相位等额外方差，信息缺口 > mel-spectrogram
+		- 整句波形极长，GPU 显存限制下只能切短片段训练 → 跨片段依赖难捕捉
+	- 应对策略
+		- adversarial 波形解码器
+			- 结构：WaveNet-like 非因果卷积 + 门控激活；上采样用转置 1D-CNN
+			- 目标：多分辨率STFT损失 + LSGAN 判别器损失，强制网络自行补全相位
+		- 借助 FS2 文本编码器
+			- 先完整训练 FS2（文本→mel），保留其 encoder + variance adaptor，保证长程文本特征质量
+			- 波形解码器仅接收“切片隐藏序列”→ 局部波形，减轻显存压力
+	- 训练流程
+		- 步骤 1：训练 FS2 至收敛（得到文本→隐藏→mel 通路）
+		- 步骤 2：冻结 encoder/variance adaptor，随机切 1 s 片段，隐藏序列→波形解码器→短 PCM，判别器同步对抗更新
+	- 推理流程
+		- 丢弃 mel-decoder，文本→隐藏→波形解码器一次性输出整句 PCM
+		- 全并行，GPU上RTF<0.1，首次实现“phoneme→waveform”端到端实时合成
+6. FastSpeech 2 & 2s 与同期工作对比
+	- vs 自回归系统
+		- Deep Voice 1/2、Char2Wav 等逐样本生成波形，RTF 高且鲁棒性差
+		- FS2/2s 全程并行，mel 或波形一步输出，RTF < 0.1，跳词/重复接近零
+	- vs 其他非自回归声学模型
+		- 多数工作仅优化时长准确率；FS2 额外引入帧级 pitch(CWT) + energy，信息缺口更小，音质↑
+		- 同期 Glow-TTS、SpeedySpeech 仍输出 mel，需外挂声码器；FS2s 直接 text→waveform，pipeline 更短
+	- vs 并行 text-to-waveform 同期方案
+		- ClariNet：自回归 acoustic + 并行 vocoder，acoustic 阶段仍是瓶颈
+		- EATS：不可控插值时长 + 无显式 variance；FS2s 提供 variance adaptor 三轴条件，可控性更强
+	- 定位总结
+		- FS2：首个“真实 mel + 多 variance”并行声学模型
+		- FS2s：首次实现**完全并行、完全端到端** phoneme→waveform，兼具速度、鲁棒与可控
+7. 结论与展望
+	- 主要成果
+		- 简化训练：丢弃教师-蒸馏，直接以真实 mel 为目标，训练时间 ↓ 3×
+		- 缓解一对多：引入 MFA 时长 + CWT 基频 + 帧级能量，信息缺口↓，音质↑
+		- 并行 waveform，FastSpeech 2s 首版实现完全非自回归 phoneme→PCM
+	- 当前局限
+		- 仍依赖外部 MFA 与 F0 提取工具，非“纯”端到端
+		- 三预测器增加参数量，移动端需进一步压缩
+	- 未来方向（作者展望）
+		- 无外部对齐：自监督时长 + 基频估计，实现“零工具”完全端到端
+		- 更多方差：情感、风格、 speaker embedding 统一纳入 variance adaptor
+		- 轻量化：知识蒸馏、NAS、稀疏化，把 RTF 压到 0.01 级别，适配边缘设备
